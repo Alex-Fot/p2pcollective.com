@@ -73,13 +73,41 @@ class ActiveLoansController < ApplicationController
   end
 
   def show
-    @active_loan = ActiveLoan.find(params[:id])
+    begin
+      @active_loan = ActiveLoan.find(params[:id])
 
-    render layout: "portfolios"
+      is_borrower = @active_loan.user_id == current_user.id
+      is_investor = Investment.exists?(active_loan_id: @active_loan.id, user_id: current_user.id)
+
+      unless is_borrower || is_investor
+        redirect_to root_path, notice: 'You are not authorized to view this loan.'
+        return
+      end
+
+      render layout: "portfolios"
+    rescue ActiveRecord::RecordNotFound
+      redirect_to root_path, notice: 'Loan not found.'
+    end
   end
 
   def invest
-    active_loan_id = params[:id].to_i
+    begin
+      @active_loan = ActiveLoan.find(params[:id].to_i)
+    rescue ActiveRecord::RecordNotFound
+      redirect_to root_path, notice: 'Loan not found.'
+      return
+    end
+
+    if current_user.id == @active_loan.user_id
+      redirect_to root_path, notice: 'You cannot invest in your own loan.'
+      return
+    end
+
+    if @active_loan.status != 'unfunded'
+      redirect_to root_path, notice: 'This loan is not currently accepting investments.'
+      return
+    end
+
     investment_amount = (params[:investment_amount].to_f * 100)
 
     # Checks if the user has enough money in their Cash account to invest
@@ -88,7 +116,7 @@ class ActiveLoansController < ApplicationController
       # Checks if the new investment amount pushes the loan to become fully funded      
       # Calculate total invested in the loan so far
       amount_invested_so_far = 0.0
-      relevant_investment_records = Investment.where(active_loan_id: active_loan_id)
+      relevant_investment_records = Investment.where(active_loan_id: @active_loan.id)
       relevant_investment_records.each do |investment_record|
         amount_invested_so_far += investment_record.opening_balance.to_f
       end
@@ -96,19 +124,19 @@ class ActiveLoansController < ApplicationController
       
       
       # If the new investment amount pushes the loan to become over funded, tells them so
-      if (amount_invested_so_far + investment_amount) > ActiveLoan.find(active_loan_id).opening_balance.to_f
+      if (amount_invested_so_far + investment_amount) > @active_loan.opening_balance.to_f
         redirect_to root_path, notice: "The borrower doesn't need that much. Please invest a lower amount"
-        # redirect_to show_active_loan_path(id: active_loan_id), notice: "The borrower doesn't need that much. Please invest a lower amount"
+        # redirect_to show_active_loan_path(id: @active_loan.id), notice: "The borrower doesn't need that much. Please invest a lower amount"
         
       # Elsif the new investment amount pushes the loan to become 100% funded, execute required Logic
-      elsif (amount_invested_so_far + investment_amount) == ActiveLoan.find(active_loan_id).opening_balance.to_f
+      elsif (amount_invested_so_far + investment_amount) == @active_loan.opening_balance.to_f
         # Calculate the investor's share of borrower's monthly repayment obligation 
-        percentage_of_loan_amount = (investment_amount * 100) / (ActiveLoan.find(active_loan_id).opening_balance.to_f)
-        repayment_amount = ((ActiveLoan.find(active_loan_id).periodic_repayment_amount.to_f * percentage_of_loan_amount)).round(2)
+        percentage_of_loan_amount = (investment_amount * 100) / (@active_loan.opening_balance.to_f)
+        repayment_amount = ((@active_loan.periodic_repayment_amount.to_f * percentage_of_loan_amount)).round(2)
         
         # Logic to create an investment record
         investment_details = ({
-          active_loan_id: active_loan_id,
+          active_loan_id: @active_loan.id,
           user_id: current_user.id,
           opening_balance: investment_amount,
           repayment_amount: repayment_amount,
@@ -126,11 +154,11 @@ class ActiveLoansController < ApplicationController
         
         if Investment.create!(investment_details) && Transaction.create!(investor_transaction_details) && 
           # Changes status of loan from unfunded to funded
-          investments = Investment.where(active_loan_id: active_loan_id)
+          investments = Investment.where(active_loan_id: @active_loan.id)
 
           # Create the transactions to move outstanding lonas into the cash account for the borrower
-          lender_user_id = ActiveLoan.find(active_loan_id).user_id
-          loan_amount = ActiveLoan.find(active_loan_id).opening_balance
+          lender_user_id = @active_loan.user_id
+          loan_amount = @active_loan.opening_balance
           lender_outstanding_loans_account_id = Account.where(user_id: lender_user_id).where(label: "Outstanding loans").first.id
           lender_cash_account_id = Account.where(user_id: lender_user_id).where(label: "Cash").first.id
           lender_transaction_details = ({
@@ -160,22 +188,22 @@ class ActiveLoansController < ApplicationController
           ])
           end
 
-          ActiveLoan.find(active_loan_id).update(status: "funded")
-          redirect_to root_path, notice: "You have invested $#{investment_amount / 100} to active loan #{active_loan_id}!" 
+          @active_loan.update(status: "funded")
+          redirect_to root_path, notice: "You have invested $#{investment_amount / 100} to active loan #{@active_loan.id}!" 
         else
           redirect_to root_path, notice: "Something went wrong. Please try again."
-          # redirect_to show_active_loan_path(id: active_loan_id), notice: "Something went wrong. Please try again."
+          # redirect_to show_active_loan_path(id: @active_loan.id), notice: "Something went wrong. Please try again."
         end
 
         # Elsif the new investment amount doesn't pushes the loan to become 100% funded, execute required Logic
-      elsif (amount_invested_so_far + investment_amount) < ActiveLoan.find(active_loan_id).opening_balance.to_f
+      elsif (amount_invested_so_far + investment_amount) < @active_loan.opening_balance.to_f
         # Calculate the investor's share of borrower's monthly repayment obligation 
-        percentage_of_loan_amount = (investment_amount * 100) / (ActiveLoan.find(active_loan_id).opening_balance.to_f)
-        repayment_amount = ((ActiveLoan.find(active_loan_id).periodic_repayment_amount.to_f * percentage_of_loan_amount)).round(2)
+        percentage_of_loan_amount = (investment_amount * 100) / (@active_loan.opening_balance.to_f)
+        repayment_amount = ((@active_loan.periodic_repayment_amount.to_f * percentage_of_loan_amount)).round(2)
         
         # Logic to create an investment record
         investment_details = ({
-          active_loan_id: active_loan_id,
+          active_loan_id: @active_loan.id,
           user_id: current_user.id,
           opening_balance: investment_amount,
           repayment_amount: repayment_amount,
@@ -192,10 +220,10 @@ class ActiveLoansController < ApplicationController
         })
 
         if Investment.create!(investment_details) && Transaction.create!(transaction_details)
-          redirect_to root_path, notice: "You have committed $#{investment_amount / 100} to active loan #{active_loan_id}!" 
+          redirect_to root_path, notice: "You have committed $#{investment_amount / 100} to active loan #{@active_loan.id}!" 
         else
           redirect_to root_path, notice: "Something went wrong. Please try again."
-          # redirect_to show_active_loan_path(id: active_loan_id), notice: "Something went wrong. Please try again."
+          # redirect_to show_active_loan_path(id: @active_loan.id), notice: "Something went wrong. Please try again."
         end
 
       end
