@@ -6,7 +6,9 @@ class LoanApplicationsController < ApplicationController
   before_action :compare_user_id, only: [:edit, :update, :destroy, :submit, :show]
   before_action :set_loan_application, only: [:show, :edit, :update, :destroy]
   before_action :check_status, only: [:edit, :update, :destroy, :submit]
+  before_action :validate_loan_application_status, only: [:index]
   
+  VALID_LOAN_APPLICATION_STATUSES = ["saved", "being assessed", "assessed", "declined"]
   
   # GET /loan_applications
   # GET /loan_applications.json
@@ -120,5 +122,11 @@ class LoanApplicationsController < ApplicationController
     # Never trust parameters from the scary internet, only allow the white list through.
     def loan_application_params
       params.require(:loan_application).permit(:first_name, :last_name, :loan_term, :purpose, :loan_category_id, :street_address, :city, :state, :postcode, :employment_type_id, :work_gap_months, :license, :pay_slip)
+    end
+
+    def validate_loan_application_status
+      if params[:status].present? && !VALID_LOAN_APPLICATION_STATUSES.include?(params[:status])
+        redirect_to my_loan_applications_path(status: "saved"), notice: 'Invalid status provided.'
+      end
     end
 end

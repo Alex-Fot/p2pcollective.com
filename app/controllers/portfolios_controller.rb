@@ -44,23 +44,76 @@ class PortfoliosController < ApplicationController
   end
 
   def withdraw_confirmation
-    @amount = params[:amount]
-    
-    if @amount.to_i <= retrieve_balance(account_id("Cash"))/100
-      Transaction.create!([
-        amount: @amount.to_i * 100,
-        from_account_id: account_id("Cash")[0],
-        to_account_id: account_id("Bank account")[0],
-        from_account_balance: (retrieve_balance(account_id("Cash")).to_i - (@amount.to_i * 100)),
-        to_account_balance: (retrieve_balance(account_id("Bank account")).to_i + (@amount.to_i * 100)),
-        transaction_type: "principal"
-      ])
+    raw_amount = params[:amount]
+    amount_in_cents = nil
 
-      redirect_to root_path, notice: "You have successfully withdrawn $#{@amount}."
-    else
-      redirect_to withdraw_cash_path, notice: "You do not have enough cash in your account to withdraw $#{@amount}."
+    begin
+      # Attempt to convert to float first to handle decimal inputs, then to cents
+      amount_in_cents = (Float(raw_amount) * 100).to_i
+    rescue ArgumentError, TypeError
+      flash[:error] = "Invalid amount entered. Please enter a valid number."
+      redirect_to withdraw_cash_path
+      return
     end
 
+    if amount_in_cents <= 0
+      flash[:error] = "Withdrawal amount must be positive."
+      redirect_to withdraw_cash_path
+      return
+    end
+
+    ActiveRecord::Base.transaction do
+      cash_account = current_user.accounts.find_by(label: "Cash")
+      unless cash_account
+        flash[:error] = 'Cash account not found.'
+        redirect_to withdraw_cash_path # Or root_path, depending on desired UX
+        raise ActiveRecord::Rollback # Ensure transaction is rolled back
+      end
+
+      # Lock the cash account row to prevent race conditions
+      cash_account.lock!
+
+      # Retrieve the current balance *after* locking
+      # Assuming retrieve_balance takes an account ID and returns balance in cents
+      current_cash_balance_in_cents = retrieve_balance(cash_account.id)
+
+      if amount_in_cents <= current_cash_balance_in_cents
+        bank_account = current_user.accounts.find_by(label: "Bank account")
+        unless bank_account
+          flash[:error] = 'Bank account not found for withdrawal.'
+          redirect_to withdraw_cash_path
+          raise ActiveRecord::Rollback
+        end
+
+        # For simplicity, not locking bank_account here, but could be done if necessary
+        current_bank_balance_in_cents = retrieve_balance(bank_account.id)
+
+        Transaction.create!(
+          amount: amount_in_cents,
+          from_account_id: cash_account.id,
+          to_account_id: bank_account.id,
+          from_account_balance: current_cash_balance_in_cents - amount_in_cents,
+          to_account_balance: current_bank_balance_in_cents + amount_in_cents,
+          transaction_type: "principal",
+          description: "Withdrawal to bank account" # Optional: add description
+        )
+        # Use raw_amount for user-facing notice to show their original input
+        redirect_to root_path, notice: "You have successfully withdrawn $#{raw_amount}."
+      else
+        # Use raw_amount for user-facing notice
+        redirect_to withdraw_cash_path, notice: "You do not have enough cash in your account to withdraw $#{raw_amount}."
+        # No need to raise ActiveRecord::Rollback here as it's a read operation that failed the check
+      end
+    end
+  rescue ActiveRecord::RecordInvalid => e
+    # This can happen if Transaction.create! fails validation
+    flash[:error] = "Withdrawal failed: #{e.message}"
+    redirect_to withdraw_cash_path
+  rescue StandardError => e
+    # Catch other potential errors during the transaction
+    flash[:error] = "An unexpected error occurred during withdrawal. Please try again."
+    Rails.logger.error "Withdrawal Error: #{e.message}\n#{e.backtrace.join("\n")}"
+    redirect_to withdraw_cash_path
   end
 
 

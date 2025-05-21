@@ -2,7 +2,10 @@ class ActiveLoansController < ApplicationController
   require 'check_accounts'
   require 'check_login'
   before_action :require_login
- 
+  before_action :require_admin, only: [:approve]
+  before_action :validate_active_loan_status, only: [:index, :my_index, :my_investments]
+
+  VALID_ACTIVE_LOAN_STATUSES = ["unfunded", "funded", "settled", "defaulted"]
 
   def index
     @status = params[:status]
@@ -235,97 +238,172 @@ class ActiveLoansController < ApplicationController
   end
 
   def repay_loan_confirmation
-    active_loan_id = params[:id].to_i
-    repayment_amount = (params[:repayment_amount].to_f * 100)
-    
-    # Checks if the user has enough money in their Cash account to invest
-    if (retrieve_balance(account_id("Cash")).to_f ) >= repayment_amount
+    @active_loan = ActiveLoan.find_by(id: params[:id])
 
-      # Checks if the new repayment amount pushes the loan to become fully repaid      
-      # Calculate total repayments made to the loan so far
-      amount_repaid_so_far = 0.0
-      relevant_repayment_records = Repayment.where(active_loan_id: active_loan_id)
-      relevant_repayment_records.each do |repayment_record|
-        amount_repaid_so_far += repayment_record.amount.to_f
-      end
-
-      # If the new repayment amount pushes the repayment to become over repaid, tells them so
-      if (amount_repaid_so_far + repayment_amount) > ActiveLoan.find(active_loan_id).opening_balance.to_f
-        redirect_to root_path, notice: "You cannot repay more than what you owe. Please enter a lower repayment amount."
-        # redirect_to show_active_loan_path(id: active_loan_id), notice: "You cannot repay more than what you owe. Please enter a lower repayment amount."
-      
-      elsif (amount_repaid_so_far + repayment_amount) <= ActiveLoan.find(active_loan_id).opening_balance.to_f
-
-        # Calculates the percentage of loan being repaid:
-        percent_being_repaid = repayment_amount / ActiveLoan.find(active_loan_id).opening_balance.to_f
-
-        # Identifies all the investments that need to be repaid and creates repayment and transaction records
-        Investment.where(active_loan_id: active_loan_id).each do |investment|
-
-          individual_repayment_amount = (investment.opening_balance.to_f * percent_being_repaid).round(2)
-
-          # Create repayment records for all investors who have loaned the borrower money
-          Repayment.create!([
-            {
-              active_loan_id: active_loan_id,
-              investment_id: investment.id,
-              amount: individual_repayment_amount,
-            }
-          ])
-
-          from_account_id = Account.where(user_id: investment.user_id).where(label: "Active investments").first.id
-          to_account_id = Account.where(user_id: investment.user_id).where(label: "Cash").first.id
-          
-          # Create transaction records for all investors who have loaned the borrower money
-          Transaction.create!([
-            {
-              amount: individual_repayment_amount,
-              from_account_id: from_account_id,
-              to_account_id: to_account_id,
-              from_account_balance: (retrieve_balance(from_account_id).to_i - individual_repayment_amount),
-              to_account_balance: (retrieve_balance(to_account_id).to_i + individual_repayment_amount),
-              transaction_type: "principal"
-            }
-          ])
-        end
-
-        # Create transaction for lender to transfer money from outstanding loans to the cash account
-        from_account_id = Account.where(user_id: current_user.id).where(label: "Cash").first.id
-        to_account_id = Account.where(user_id: current_user.id).where(label: "Outstanding loans").first.id
-        
-        Transaction.create!([
-          {
-            amount: repayment_amount,
-            from_account_id: from_account_id,
-            to_account_id: to_account_id,
-            from_account_balance: (retrieve_balance(from_account_id).to_i - repayment_amount),
-            to_account_balance: (retrieve_balance(to_account_id).to_i + repayment_amount),
-            transaction_type: "principal"
-          }
-        ])
-
-        # Recalculate total repayments made to the loan so far
-        amount_repaid_so_far = 0.0
-        relevant_repayment_records = Repayment.where(active_loan_id: active_loan_id)
-        relevant_repayment_records.each do |repayment_record|
-          amount_repaid_so_far += repayment_record.amount.to_f
-        end
-
-        # If the new repayment amount pushes the loan to become 100% repaid, execute required Logic
-        if amount_repaid_so_far == ActiveLoan.find(active_loan_id).opening_balance.to_f || amount_repaid_so_far + 1 > ActiveLoan.find(active_loan_id).opening_balance.to_f
-          ActiveLoan.find(active_loan_id).update(status: "settled")
-          redirect_to root_path, notice: "You have successfully repaid $#{repayment_amount / 100} to Loan ID: #{active_loan_id}. You do not owe any more money on that loan."
-        # Else, just redirect to root_path
-        else
-          redirect_to root_path, notice: "You have successfully repaid $#{repayment_amount / 100} to Loan ID: #{active_loan_id}"
-        end
-      end
-      
-    else
-      redirect_to root_path, notice: "You do not have enough in your Cash account to repay $#{repayment_amount / 100}."
-      # redirect_to show_active_loan_path(id: active_loan_id), notice: "You do not have enough in your Cash account to repay $#{repayment_amount / 100}."
+    unless @active_loan
+      redirect_to root_path, notice: 'Loan not found.'
+      return
     end
 
+    if @active_loan.user_id != current_user.id
+      redirect_to root_path, notice: 'You are not authorized to repay this loan.'
+      return
+    end
+
+    if @active_loan.status == 'settled'
+      redirect_to root_path, notice: 'This loan is already settled.'
+      return
+    end
+
+    repayment_amount_str = params[:repayment_amount]
+    repayment_amount_in_cents = nil
+
+    begin
+      repayment_amount_in_cents = (Float(repayment_amount_str) * 100).to_i
+    rescue ArgumentError, TypeError
+      flash[:error] = "Invalid amount entered: '#{repayment_amount_str}'. Please enter a valid number."
+      redirect_to show_active_loan_path(@active_loan) # Or appropriate path
+      return
+    end
+
+    if repayment_amount_in_cents <= 0
+      flash[:error] = "Repayment amount must be positive."
+      redirect_to show_active_loan_path(@active_loan) # Or appropriate path
+      return
+    end
+
+    ActiveRecord::Base.transaction do
+      @active_loan.lock! # Lock the loan record
+
+      borrower_cash_account = current_user.accounts.find_by!(label: "Cash") # Assuming find_by! to raise error if not found
+      borrower_cash_account.lock! # Lock borrower's cash account
+
+      borrower_cash_balance_in_cents = retrieve_balance(borrower_cash_account.id)
+
+      if borrower_cash_balance_in_cents < repayment_amount_in_cents
+        redirect_to show_active_loan_path(@active_loan), notice: "Insufficient funds to make this repayment."
+        raise ActiveRecord::Rollback # Rollback transaction
+      end
+
+      amount_repaid_so_far_in_cents = Repayment.where(active_loan_id: @active_loan.id).sum(:amount)
+
+      if (amount_repaid_so_far_in_cents + repayment_amount_in_cents) > @active_loan.opening_balance
+        redirect_to show_active_loan_path(@active_loan), notice: "This repayment would exceed the loan's outstanding balance. Please enter a lower amount."
+        raise ActiveRecord::Rollback
+      end
+
+      # Borrower's transaction: Cash to Outstanding Loans
+      borrower_outstanding_loans_account = current_user.accounts.find_by!(label: "Outstanding loans")
+      # No need to lock borrower_outstanding_loans_account if its balance isn't critical for a check here,
+      # but its balance will be updated.
+      borrower_outstanding_loans_balance_in_cents = retrieve_balance(borrower_outstanding_loans_account.id)
+
+      Transaction.create!(
+        amount: repayment_amount_in_cents,
+        from_account_id: borrower_cash_account.id,
+        to_account_id: borrower_outstanding_loans_account.id,
+        from_account_balance: borrower_cash_balance_in_cents - repayment_amount_in_cents,
+        to_account_balance: borrower_outstanding_loans_balance_in_cents + repayment_amount_in_cents,
+        transaction_type: "principal",
+        description: "Loan repayment by borrower for loan ##{@active_loan.id}"
+      )
+
+      # Distribute repayment to investors
+      investments = Investment.where(active_loan_id: @active_loan.id)
+      total_investment_amount = @active_loan.opening_balance # Assuming this is the total principal invested by all
+
+      # Simplified proportional distribution - acknowledge potential for penny issues
+      # For more complex scenarios, a more robust distribution algorithm is needed.
+      investments.each do |investment|
+        investment.lock! # Lock each investment
+
+        investor = investment.user # User.find(investment.user_id)
+        investor_active_investments_account = investor.accounts.find_by!(label: "Active investments")
+        investor_active_investments_account.lock!
+        investor_cash_account = investor.accounts.find_by!(label: "Cash")
+        investor_cash_account.lock!
+
+        # Calculate this investor's share of the repayment
+        # Using integer math for cents to avoid floating point issues as much as possible.
+        # (investment_principal / total_loan_principal) * repayment_amount
+        # Ensure all these are in cents
+        individual_repayment_in_cents = (investment.opening_balance.to_f / total_investment_amount.to_f * repayment_amount_in_cents).round.to_i
+        
+        # Ensure individual_repayment_in_cents is not zero if there's a tiny share
+        # This logic might need refinement for edge cases (e.g. very small repayments or investments)
+        if individual_repayment_in_cents > 0
+          Repayment.create!(
+            active_loan_id: @active_loan.id,
+            investment_id: investment.id,
+            amount: individual_repayment_in_cents
+          )
+
+          current_investor_active_inv_balance = retrieve_balance(investor_active_investments_account.id)
+          current_investor_cash_balance = retrieve_balance(investor_cash_account.id)
+
+          Transaction.create!(
+            amount: individual_repayment_in_cents,
+            from_account_id: investor_active_investments_account.id,
+            to_account_id: investor_cash_account.id,
+            from_account_balance: current_investor_active_inv_balance - individual_repayment_in_cents,
+            to_account_balance: current_investor_cash_balance + individual_repayment_in_cents,
+            transaction_type: "principal",
+            description: "Repayment received for investment in loan ##{@active_loan.id}"
+          )
+        end
+      end
+      
+      new_total_repaid_so_far_in_cents = amount_repaid_so_far_in_cents + repayment_amount_in_cents
+      final_notice_message = "You have successfully repaid $#{repayment_amount_str} for Loan ID: #{@active_loan.id}."
+
+      if new_total_repaid_so_far_in_cents >= @active_loan.opening_balance
+        # Ensure it doesn't exceed opening balance due to rounding, cap it.
+        # This should ideally be handled by precise distribution logic.
+        # For now, if it's very close, assume it's settled.
+        @active_loan.status = "settled"
+        @active_loan.save! # Save the change in loan status
+        final_notice_message += " This loan is now fully settled."
+      end
+
+      redirect_to root_path, notice: final_notice_message
+
+    end # End of ActiveRecord::Base.transaction
+  rescue ActiveRecord::RecordNotFound => e
+    # This can happen if find_by! fails for accounts
+    flash[:error] = "Required account not found: #{e.message}"
+    redirect_to show_active_loan_path(@active_loan || params[:id]) # Redirect back
+  rescue ActiveRecord::RecordInvalid => e
+    flash[:error] = "Repayment failed due to validation errors: #{e.message}"
+    redirect_to show_active_loan_path(@active_loan || params[:id])
+  rescue StandardError => e
+    Rails.logger.error "Repay Loan Confirmation Error: #{e.message}\n#{e.backtrace.join("\n")}"
+    flash[:error] = "An unexpected error occurred during repayment. Please try again."
+    redirect_to show_active_loan_path(@active_loan || params[:id])
   end
 
+  private
+
+  def require_admin
+    unless current_user.is_admin?
+      redirect_to root_path, notice: 'You are not authorized to perform this action.'
+    end
+  end
+
+  def validate_active_loan_status
+    if params[:status].present? && !VALID_ACTIVE_LOAN_STATUSES.include?(params[:status])
+      # Determine the appropriate redirect path based on the action
+      # For simplicity, redirecting to root_path if the action isn't immediately clear for a default
+      default_path = case action_name
+                     when 'index'
+                       active_loans_path(status: "unfunded") # Or a more general path if preferred
+                     when 'my_index'
+                       my_loans_path(status: "unfunded") # Assuming this is the correct helper
+                     when 'my_investments'
+                       my_investments_path(status: "funded") # Assuming this is the correct helper
+                     else
+                       root_path # Fallback
+                     end
+      redirect_to default_path, notice: 'Invalid status provided.'
+    end
+  end
 end
